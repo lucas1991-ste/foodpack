@@ -7,7 +7,7 @@ on:
 jobs:
   dump:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     permissions:
       contents: write
 
@@ -30,14 +30,51 @@ jobs:
           FB_PAGE_TOKEN: ${{ secrets.FB_PAGE_TOKEN }}
         run: python sync_images.py
 
-      - name: Commit e push
+      # Un push unico di ~2 GB va in timeout (HTTP 408). Si committa e si
+      # fa push a blocchi di 100 file: ogni trasferimento resta piccolo e,
+      # se il job si interrompe, i blocchi gia' spinti restano salvati.
+      - name: Commit e push a blocchi
+        shell: bash
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add images manifest.json
-          if git diff --cached --quiet; then
-            echo "Nessuna nuova immagine da salvare."
-          else
-            git commit -m "Dump immagini packprint [skip ci]"
-            git push
-          fi
+          # Buffer e timeout HTTP generosi per trasferimenti pesanti
+          git config http.postBuffer 524288000
+          git config http.lowSpeedLimit 0
+          git config http.lowSpeedTime 999999
+
+          BATCH=100
+          block=0
+          push_failed=0
+          n=0
+
+          push_with_retry() {
+            local ok=0
+            for a in 1 2 3 4 5; do
+              if git push; then ok=1; break; else
+                echo "::warning::push fallito (tentativo $a), riprovo tra 15s"
+                sleep 15
+              fi
+            done
+            [ "$ok" -eq 1 ] || push_failed=1
+          }
+
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            git add -- "$f"
+            n=$((n+1))
+            if [ $((n % BATCH)) -eq 0 ]; then
+              block=$((block+1))
+              git commit -m "Dump immagini - blocco ${block} [skip ci]" || true
+              push_with_retry
+            fi
+          done < <(find images -type f | sort)
+
+          # manifest finale + eventuale coda di file rimasti
+          git add manifest.json
+          git commit -m "Dump immagini - manifest [skip ci]" || true
+          push_with_retry
+
+          echo "File aggiunti: ${n} | blocchi committati: ${block}"
+          exit "$push_failed"
