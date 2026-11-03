@@ -473,11 +473,87 @@ def fetch_sitemap_urls(kind: str) -> list[str]:
     return uniq
 
 
+def fetch_homepage_menu() -> dict[str, str]:
+    """
+    Mappa collezione -> sezione letta dal mega-menu della homepage:
+    e' la gerarchia ufficiale del sito. Ogni volta che nell'header compare
+    un link a una pagina sezione, le collezioni che seguono sono sue.
+    """
+    try:
+        r = get(SITE_BASE + "/")
+        if r.status_code != 200:
+            return {}
+        html_txt = r.text
+        end = html_txt.find("</header>")
+        region = html_txt[:end] if end > 0 else html_txt
+        menu: dict[str, str] = {}
+        current = None
+        for m in re.finditer(
+                r'href="(/pages/([a-z0-9-]+)|/collections/([a-zA-Z0-9%.-]+))"',
+                region):
+            if m.group(2):
+                if m.group(2) in SECTION_PAGES:
+                    current = m.group(2)
+            elif current:
+                menu.setdefault(unquote(m.group(3)), current)
+        log.info("Mega-menu: %d collezioni classificate", len(menu))
+        return menu
+    except Exception as exc:
+        log.warning("Mega-menu non leggibile: %s", exc)
+        return {}
+
+
+def pattern_section(slug: str) -> str | None:
+    """Sezione dedotta dal nome della collezione (es. vedi-tutti, shopper...)."""
+    s = slug.lower()
+    if "packaging-alimentare" in s:
+        return "packaging-alimentare"
+    if "arredo-tavola" in s:
+        return "arredo-tavola"
+    if "retail" in s or "shopper" in s:
+        return "retail"
+    return None
+
+
+def build_section_map(page_colls: dict[str, set[str]],
+                      all_slugs: list[str]) -> dict[str, str]:
+    """
+    Mappa definitiva collezione -> sezione, con priorita':
+      1. mega-menu della homepage (gerarchia ufficiale)
+      2. collezioni linkate da UNA SOLA pagina sezione
+      3. pattern nel nome (packaging-alimentare-vedi-tutti, shopper-*...)
+    L'ordine di inserimento e' forte->debole: chi consuma la mappa con
+    setdefault assegna ai prodotti prima le sezioni ufficiali.
+    """
+    coll_section: dict[str, str] = {}
+    strong = 0
+    for c, sec in fetch_homepage_menu().items():
+        coll_section[c] = sec
+        strong += 1
+    for sec in SECTION_PAGES:
+        others = [v for k, v in page_colls.items() if k != sec]
+        union_others = set().union(*others) if others else set()
+        for c in page_colls.get(sec, set()):
+            if c not in coll_section and c not in union_others:
+                coll_section[c] = sec
+                strong += 1
+    pattern = 0
+    for c in all_slugs:
+        if c not in coll_section:
+            sec = pattern_section(c)
+            if sec:
+                coll_section[c] = sec
+                pattern += 1
+    log.info("Mappa sezioni: %d collezioni (%d da menu/pagine esclusive, "
+             "%d da pattern nome)", len(coll_section), strong, pattern)
+    return coll_section
+
+
 def sync_site() -> None:
     log.info("=== SITO: %s ===", SITE_BASE)
 
-    # -- 1. mappa sezione -> collezioni (dal menu delle pagine sezione) ------ #
-    coll_section: dict[str, str] = {}      # collection handle -> sezione
+    # -- 1. pagine sezione: immagini della pagina + collezioni linkate ------- #
+    page_colls: dict[str, set[str]] = {}
     page_jobs: list = []                   # download differiti
     page_urls_done: set[str] = set()
 
@@ -490,9 +566,10 @@ def sync_site() -> None:
             log.warning("Pagina sezione %s non raggiungibile: %s", sec, exc)
             continue
         log.info("Sezione '%s': analizzo la pagina", sec)
-        handles = re.findall(r'href="/collections/([a-zA-Z0-9%.-]+)"', r.text)
-        for h in dict.fromkeys(handles):
-            coll_section.setdefault(unquote(h), sec)
+        page_colls[sec] = {
+            unquote(h) for h in
+            re.findall(r'href="/collections/([a-zA-Z0-9%.-]+)"', r.text)
+        }
         imgs = extract_from_html(r.text, url)
         folder = OUTPUT_DIR / "sito" / safe_slug(sec) / "pagina"
         page_jobs += collect_download_jobs(
@@ -521,6 +598,12 @@ def sync_site() -> None:
     articles = [u for u in articles if "/blogs/" in u and u.rstrip("/").count("/") >= 4]
     log.info("Dopo validazione URL: %d pagine, %d collezioni, %d prodotti",
              len(pages), len(collections), len(products))
+
+    # -- 2b. mappa collezione -> sezione (menu + esclusive + pattern) -------- #
+    coll_section = build_section_map(
+        page_colls,
+        [handle_from_url(u, "collections") for u in collections if handle_from_url(u, "collections")]
+    )
 
     # -- 3. pagine non-sezione e articoli ------------------------------------ #
     section_slugs = set(SECTION_PAGES)
@@ -581,16 +664,19 @@ def sync_site() -> None:
             f"{sec}/collezioni/{slug}" if sec else f"collezioni/{slug}", u)
         page_urls_done |= imgs
 
-        if sec:
-            try:
-                pr = get(f"{u}/products.json?limit=250")
-                if pr.status_code == 200:
-                    for p in pr.json().get("products", []):
-                        coll_products.setdefault(slug, []).append(p.get("handle", ""))
-            except Exception:
-                pass
+        # products.json per TUTTE le collezioni: serve per assegnare ogni
+        # prodotto alla sezione della sua collezione piu' specifica
+        try:
+            pr = get(f"{u}/products.json?limit=250")
+            if pr.status_code == 200:
+                for p in pr.json().get("products", []):
+                    coll_products.setdefault(slug, []).append(p.get("handle", ""))
+        except Exception:
+            pass
 
     # -- 5. prodotti --------------------------------------------------------- #
+    # la mappa e' ordinata forte->debole (menu/esclusive prima dei pattern):
+    # il primo setdefault assegna la sezione piu' specifica disponibile
     handle_section: dict[str, str] = {}
     for slug, section in coll_section.items():
         for h in coll_products.get(slug, []):
