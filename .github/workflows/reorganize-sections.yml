@@ -1,0 +1,44 @@
+name: Riorganizza immagini per sezione
+
+# Da eseguire UNA volta dopo il primo dump (o dopo grossi aggiornamenti
+# del menu del sito): sposta i file gia' scaricati nelle sezioni giuste
+# secondo il mega-menu ufficiale, senza riscaricare nulla.
+on:
+  workflow_dispatch:
+
+jobs:
+  reorganize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installa dipendenze
+        run: pip install -r requirements.txt
+
+      - name: Riorganizza le immagini
+        run: python reorganize_sections.py
+
+      - name: Commit e push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          git add -A images manifest.json
+          if git diff --cached --quiet; then
+            echo "Organizzazione gia' corretta: nessuna modifica."
+          else
+            git commit -m "Riorganizza immagini per sezione (menu ufficiale) [skip ci]"
+            for a in 1 2 3; do
+              if git push; then break; else echo "push retry $a"; sleep 15; fi
+            done
+          fi
